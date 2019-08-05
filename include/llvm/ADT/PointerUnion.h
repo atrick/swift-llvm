@@ -84,7 +84,20 @@ public:
 ///    P = (float*)0;
 ///    Y = P.get<float*>();   // ok.
 ///    X = P.get<int*>();     // runtime assertion failure.
+///
+/// The first pointer type, PT1, may be any type with PointerLikeTypeTraits,
+/// such as PointerIntPair. The isNull property is not computed recursively
+/// through PT1. So, a PointerIntPair with a null pointer part and non-zero
+/// integer part is *not* considered to be null when part of a PointerUnion.
+///
+/// The second pointer type, PT2, may either be a proper C++ pointer type or may
+/// itself be a nested PointerUnion. The isNull property is computed recursively
+/// through PT2, so the outer isNull property is true only when all inner
+/// pointers are null independent of discriminator bits.
 template <typename PT1, typename PT2> class PointerUnion {
+  template <typename T1, typename T2, typename T3, typename T4>
+  friend class PointerUnion4;
+
 public:
   using ValTy =
       PointerIntPair<void *, 1, bool, PointerUnionUIntTraits<PT1, PT2>>;
@@ -114,7 +127,8 @@ public:
   bool isNull() const {
     // Convert from the void* to one of the pointer types, to make sure that
     // we recursively strip off low bits if we have a nested PointerUnion.
-    return !PointerLikeTypeTraits<PT1>::getFromVoidPointer(Val.getPointer());
+    // The assumption is that only the second pointer type, PT2, may be nested.
+    return !PointerLikeTypeTraits<PT2>::getFromVoidPointer(Val.getPointer());
   }
 
   explicit operator bool() const { return !isNull(); }
@@ -156,7 +170,8 @@ public:
   PT1 *getAddrOfPtr1() {
     assert(is<PT1>() && "Val is not the first pointer");
     assert(
-        get<PT1>() == Val.getPointer() &&
+        PointerLikeTypeTraits<PT1>::getAsVoidPointer(get<PT1>())
+        == Val.getPointer() &&
         "Can't get the address because PointerLikeTypeTraits changes the ptr");
     return const_cast<PT1 *>(
         reinterpret_cast<const PT1 *>(Val.getAddrOfPointer()));
@@ -228,8 +243,8 @@ struct PointerLikeTypeTraits<PointerUnion<PT1, PT2>> {
 /// for usage.
 template <typename PT1, typename PT2, typename PT3> class PointerUnion3 {
 public:
-  using InnerUnion = PointerUnion<PT1, PT2>;
-  using ValTy = PointerUnion<InnerUnion, PT3>;
+  using InnerUnion = PointerUnion<PT2, PT3>;
+  using ValTy = PointerUnion<PT1, InnerUnion>;
 
 private:
   ValTy Val;
@@ -249,10 +264,10 @@ private:
     }
   };
 
-  struct IsPT3 {
+  struct IsPT1 {
     ValTy Val;
 
-    IsPT3(ValTy val) : Val(val) {}
+    IsPT1(ValTy val) : Val(val) {}
 
     template <typename T> int is() const { return Val.template is<T>(); }
     template <typename T> T get() const { return Val.template get<T>(); }
@@ -260,9 +275,9 @@ private:
 
 public:
   PointerUnion3() = default;
-  PointerUnion3(PT1 V) { Val = InnerUnion(V); }
+  PointerUnion3(PT1 V) { Val = V; }
   PointerUnion3(PT2 V) { Val = InnerUnion(V); }
-  PointerUnion3(PT3 V) { Val = V; }
+  PointerUnion3(PT3 V) { Val = InnerUnion(V); }
 
   /// Test if the pointer held in the union is null, regardless of
   /// which type it is.
@@ -271,10 +286,9 @@ public:
 
   /// Test if the Union currently holds the type matching T.
   template <typename T> int is() const {
-    // If T is PT1/PT2 choose IsInnerUnion otherwise choose IsPT3.
+    // If T is PT2/PT3 choose IsInnerUnion otherwise choose IsPT1.
     using Ty = typename ::llvm::PointerUnionTypeSelector<
-        PT1, T, IsInnerUnion,
-        ::llvm::PointerUnionTypeSelector<PT2, T, IsInnerUnion, IsPT3>>::Return;
+        PT1, T, IsPT1, IsInnerUnion>::Return;
     return Ty(Val).template is<T>();
   }
 
@@ -285,8 +299,7 @@ public:
     assert(is<T>() && "Invalid accessor called");
     // If T is PT1/PT2 choose IsInnerUnion otherwise choose IsPT3.
     using Ty = typename ::llvm::PointerUnionTypeSelector<
-        PT1, T, IsInnerUnion,
-        ::llvm::PointerUnionTypeSelector<PT2, T, IsInnerUnion, IsPT3>>::Return;
+        PT1, T, IsPT1, IsInnerUnion>::Return;
     return Ty(Val).template get<T>();
   }
 
@@ -307,7 +320,7 @@ public:
   /// Assignment operators - Allow assigning into this union from either
   /// pointer type, setting the discriminator to remember what it came from.
   const PointerUnion3 &operator=(const PT1 &RHS) {
-    Val = InnerUnion(RHS);
+    Val = RHS;
     return *this;
   }
   const PointerUnion3 &operator=(const PT2 &RHS) {
@@ -315,7 +328,7 @@ public:
     return *this;
   }
   const PointerUnion3 &operator=(const PT3 &RHS) {
-    Val = RHS;
+    Val = InnerUnion(RHS);
     return *this;
   }
 
@@ -347,6 +360,18 @@ struct PointerLikeTypeTraits<PointerUnion3<PT1, PT2, PT3>> {
 };
 
 template <typename PT1, typename PT2, typename PT3>
+bool operator==(PointerUnion3<PT1, PT2, PT3> lhs,
+                PointerUnion3<PT1, PT2, PT3> rhs) {
+  return lhs.getOpaqueValue() == rhs.getOpaqueValue();
+}
+
+template <typename PT1, typename PT2, typename PT3>
+bool operator!=(PointerUnion3<PT1, PT2, PT3> lhs,
+                PointerUnion3<PT1, PT2, PT3> rhs) {
+  return lhs.getOpaqueValue() != rhs.getOpaqueValue();
+}
+
+template <typename PT1, typename PT2, typename PT3>
 bool operator<(PointerUnion3<PT1, PT2, PT3> lhs,
                PointerUnion3<PT1, PT2, PT3> rhs) {
   return lhs.getOpaqueValue() < rhs.getOpaqueValue();
@@ -354,6 +379,13 @@ bool operator<(PointerUnion3<PT1, PT2, PT3> lhs,
 
 /// A pointer union of four pointer types. See documentation for PointerUnion
 /// for usage.
+///
+/// PointerUnion4 is expressed as a PointerUnion of two inner unions so that
+/// only two total discriminator bits are needed (one for each nesting
+/// level). This violates the assumption made by PointerUnion::isNull that only
+/// the second pointer type is nested. To preserve expected behavior for
+/// PointerUnion4::isNull, neither of the first two pointer types, PT1 and PT2,
+/// may be nested PointerUnion types.
 template <typename PT1, typename PT2, typename PT3, typename PT4>
 class PointerUnion4 {
 public:
@@ -459,6 +491,24 @@ struct PointerLikeTypeTraits<PointerUnion4<PT1, PT2, PT3, PT4>> {
         typename PointerUnion4<PT1, PT2, PT3, PT4>::ValTy>::NumLowBitsAvailable
   };
 };
+
+template <typename PT1, typename PT2, typename PT3, typename PT4>
+bool operator==(PointerUnion4<PT1, PT2, PT3, PT4> lhs,
+                PointerUnion4<PT1, PT2, PT3, PT4> rhs) {
+  return lhs.getOpaqueValue() == rhs.getOpaqueValue();
+}
+
+template <typename PT1, typename PT2, typename PT3, typename PT4>
+bool operator!=(PointerUnion4<PT1, PT2, PT3, PT4> lhs,
+                PointerUnion4<PT1, PT2, PT3, PT4> rhs) {
+  return lhs.getOpaqueValue() != rhs.getOpaqueValue();
+}
+
+template <typename PT1, typename PT2, typename PT3, typename PT4>
+bool operator<(PointerUnion4<PT1, PT2, PT3, PT4> lhs,
+               PointerUnion4<PT1, PT2, PT3, PT4> rhs) {
+  return lhs.getOpaqueValue() < rhs.getOpaqueValue();
+}
 
 // Teach DenseMap how to use PointerUnions as keys.
 template <typename T, typename U> struct DenseMapInfo<PointerUnion<T, U>> {
